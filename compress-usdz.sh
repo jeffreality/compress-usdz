@@ -10,11 +10,15 @@ BLENDER="/Applications/Blender.app/Contents/MacOS/Blender"
 PREVIEW=0
 CHECK=0
 KEEP_WORK=0
+MESH_CLEAN=0
+NO_MESH_CLEAN=0
+AGGRESSIVE_CLEAN=0
+FILL_HOLES=0
 
 usage() {
   cat <<'USAGE'
 Usage:
-  ./compress-usdz.sh -i input.usdz -o output.usdz [-jpeg 60] [-size 1024] [-decimate 0.5] [--preview] [--check]
+  ./compress-usdz.sh -i input.usdz -o output.usdz [-jpeg 60] [-size 1024] [-decimate 0.5] [--mesh-clean] [--aggressive-clean] [--fill-holes] [--preview] [--check]
 
 Examples:
   ./compress-usdz.sh -i llama.usdz -o llama_texture.usdz -jpeg 60 -size 1024
@@ -27,6 +31,10 @@ Options:
   -jpeg             JPEG quality, 1-100. Default: 70
   -size             Max texture width/height. Default: 1024
   -decimate         Blender decimate ratio. Example: 0.1
+  --mesh-clean      Run Blender safe mesh cleanup even without -decimate
+  --no-mesh-clean   Skip Blender cleanup steps inside -decimate
+  --aggressive-clean Add interior-face cleanup. More destructive; test visually.
+  --fill-holes      Try Blender fill holes. Destructive; may create untextured faces.
   --preview         Open output file after processing
   --check           Run usdchecker after processing
   --keep-work       Keep the temp folder for debugging
@@ -36,7 +44,7 @@ Requires:
   - usdzip
   - ImageMagick recommended
   - usdcat recommended for decimation path
-  - Blender only when -decimate is used
+  - Blender when -decimate, --mesh-clean, --aggressive-clean, or --fill-holes is used
 USAGE
 }
 
@@ -47,6 +55,10 @@ while [ $# -gt 0 ]; do
     -jpeg|--jpeg) JPEG_QUALITY="$2"; shift 2 ;;
     -size|--size) MAX_SIZE="$2"; shift 2 ;;
     -decimate|--decimate) DECIMATE="$2"; shift 2 ;;
+    --mesh-clean) MESH_CLEAN=1; shift ;;
+    --no-mesh-clean) NO_MESH_CLEAN=1; shift ;;
+    --aggressive-clean) AGGRESSIVE_CLEAN=1; MESH_CLEAN=1; shift ;;
+    --fill-holes) FILL_HOLES=1; MESH_CLEAN=1; shift ;;
     --preview|--open) PREVIEW=1; shift ;;
     --check) CHECK=1; shift ;;
     --keep-work) KEEP_WORK=1; shift ;;
@@ -191,8 +203,18 @@ copy_ref_asset() {
   return 0
 }
 
-if [ -n "$DECIMATE" ]; then
-  echo "Decimation requested: $DECIMATE"
+RUN_BLENDER=0
+if [ -n "$DECIMATE" ] || [ "$MESH_CLEAN" = "1" ] || [ "$AGGRESSIVE_CLEAN" = "1" ] || [ "$FILL_HOLES" = "1" ]; then
+  RUN_BLENDER=1
+fi
+
+if [ "$RUN_BLENDER" = "1" ]; then
+  if [ -n "$DECIMATE" ]; then
+    echo "Decimation requested: $DECIMATE"
+  else
+    echo "Blender mesh cleanup requested without decimation"
+    DECIMATE="1.0"
+  fi
   if [ ! -x "$BLENDER" ]; then
     echo "Blender not found at $BLENDER" >&2
     exit 1
@@ -204,10 +226,13 @@ import bpy
 import sys
 from pathlib import Path
 
-src_dir = Path(sys.argv[-4])
-root_layer = sys.argv[-3]
-output_usda = Path(sys.argv[-2])
-ratio = float(sys.argv[-1])
+src_dir = Path(sys.argv[-7])
+root_layer = sys.argv[-6]
+output_usda = Path(sys.argv[-5])
+ratio = float(sys.argv[-4])
+mesh_clean = sys.argv[-3] == "1"
+aggressive_clean = sys.argv[-2] == "1"
+fill_holes = sys.argv[-1] == "1"
 
 def clear_scene():
     bpy.ops.object.select_all(action="SELECT")
@@ -325,25 +350,76 @@ for obj in list(bpy.context.scene.objects):
     except Exception:
         pass
 
-    try:
-        bpy.ops.object.mode_set(mode="EDIT")
-        bpy.ops.mesh.select_all(action="SELECT")
-        bpy.ops.mesh.remove_doubles(threshold=0.0001)
-        bpy.ops.mesh.normals_make_consistent(inside=False)
-        bpy.ops.object.mode_set(mode="OBJECT")
-    except Exception as e:
-        print(f"Cleanup skipped for {obj.name}: {e}")
+    if mesh_clean:
         try:
-            bpy.ops.object.mode_set(mode="OBJECT")
-        except Exception:
-            pass
+            bpy.ops.object.mode_set(mode="EDIT")
 
-    mod = obj.modifiers.new("compress-usdz_decimate", "DECIMATE")
-    mod.ratio = ratio
-    try:
-        bpy.ops.object.modifier_apply(modifier=mod.name)
-    except Exception as e:
-        print(f"Decimate skipped for {obj.name}: {e}")
+            # Safe-ish cleanup for generated game assets:
+            # - Delete Loose: removes floating vertices/edges/faces not connected to a surface.
+            # - Merge by Distance: removes duplicate/near-duplicate vertices.
+            # - Dissolve Degenerate: removes zero-area faces/edges.
+            # - Recalculate Outside: fixes inverted normals.
+            # These are much less risky for UVs/textures than manifold rebuilding or boolean union.
+            bpy.ops.mesh.select_all(action="SELECT")
+            try:
+                bpy.ops.mesh.delete_loose()
+            except Exception as e:
+                print(f"Delete loose skipped for {obj.name}: {e}")
+
+            bpy.ops.mesh.select_all(action="SELECT")
+            try:
+                bpy.ops.mesh.remove_doubles(threshold=0.0001)
+            except Exception:
+                try:
+                    bpy.ops.mesh.merge_by_distance(distance=0.0001)
+                except Exception as e:
+                    print(f"Merge by distance skipped for {obj.name}: {e}")
+
+            bpy.ops.mesh.select_all(action="SELECT")
+            try:
+                bpy.ops.mesh.dissolve_degenerate(threshold=0.0001)
+            except Exception as e:
+                print(f"Dissolve degenerate skipped for {obj.name}: {e}")
+
+            if aggressive_clean:
+                # More destructive: may help with interior junk, but can affect textured models.
+                try:
+                    bpy.ops.mesh.select_all(action="DESELECT")
+                    bpy.ops.mesh.select_mode(type="FACE")
+                    bpy.ops.mesh.select_interior_faces()
+                    bpy.ops.mesh.delete(type="FACE")
+                except Exception as e:
+                    print(f"Interior face cleanup skipped for {obj.name}: {e}")
+
+            if fill_holes:
+                # Destructive: newly-created faces may not have useful UVs/materials.
+                try:
+                    bpy.ops.mesh.select_all(action="SELECT")
+                    bpy.ops.mesh.fill_holes(sides=0)
+                except Exception as e:
+                    print(f"Fill holes skipped for {obj.name}: {e}")
+
+            bpy.ops.mesh.select_all(action="SELECT")
+            try:
+                bpy.ops.mesh.normals_make_consistent(inside=False)
+            except Exception as e:
+                print(f"Recalculate normals skipped for {obj.name}: {e}")
+
+            bpy.ops.object.mode_set(mode="OBJECT")
+        except Exception as e:
+            print(f"Cleanup skipped for {obj.name}: {e}")
+            try:
+                bpy.ops.object.mode_set(mode="OBJECT")
+            except Exception:
+                pass
+
+    if ratio < 0.999:
+        mod = obj.modifiers.new("compress-usdz_decimate", "DECIMATE")
+        mod.ratio = ratio
+        try:
+            bpy.ops.object.modifier_apply(modifier=mod.name)
+        except Exception as e:
+            print(f"Decimate skipped for {obj.name}: {e}")
 
 after = tri_count()
 print(f"Triangles after:  {after:,}")
@@ -362,7 +438,13 @@ PY
   ROOT_TO_PACKAGE="reduced.usd"
   REFS_FILE="$WORKDIR/asset_refs.txt"
 
-  "$BLENDER" --background --python "$PY" -- "$SRC" "$ROOT_LAYER" "$REDUCED_USDA" "$DECIMATE"
+  BASIC_CLEAN=1
+  if [ "$NO_MESH_CLEAN" = "1" ]; then
+    BASIC_CLEAN=0
+  fi
+
+  echo "Mesh cleanup: basic=$BASIC_CLEAN aggressive=$AGGRESSIVE_CLEAN fill_holes=$FILL_HOLES"
+  "$BLENDER" --background --python "$PY" -- "$SRC" "$ROOT_LAYER" "$REDUCED_USDA" "$DECIMATE" "$BASIC_CLEAN" "$AGGRESSIVE_CLEAN" "$FILL_HOLES"
 
   echo "Scrubbing unsupported HDR references and collecting texture refs..."
   python3 - "$REDUCED_USDA" "$CLEAN_USDA" "$REFS_FILE" <<'PY'
